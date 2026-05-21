@@ -1,0 +1,190 @@
+name: Build Release APK
+
+# 手动触发或通过仓库调度
+on:
+  workflow_dispatch:
+    inputs:
+      release_type:
+        description: 'Release type (debug, release)'
+        required: true
+        default: 'debug'
+        type: choice
+        options:
+          - debug
+          - release
+      version_name:
+        description: 'Version name (e.g., 1.2.1)'
+        required: false
+        default: ''
+
+jobs:
+  build:
+    name: Build ${{ github.event.inputs.release_type == 'release' && 'Release' || 'Debug' }} APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: |
+            image=moby/buildkit:latest
+            network=host
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Download cached assets from GitHub
+        id: download-cache-github
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: podroid-assets-cache
+          path: app/src/main
+
+      - name: Download cached assets from backup URL
+        id: download-cache-backup
+        continue-on-error: true
+        if: steps.download-cache-github.outcome != 'success'
+        env:
+          CACHE_BACKUP_URL: ${{ secrets.CACHE_BACKUP_URL }}
+        run: |
+          echo "GitHub Actions artifact download failed, trying backup URL..."
+          if [ -z "$CACHE_BACKUP_URL" ]; then
+            echo "CACHE_BACKUP_URL not set, skipping backup download"
+            exit 0
+          fi
+          mkdir -p app/src/main
+          curl -L -o /tmp/podroid-assets-cache.zip "$CACHE_BACKUP_URL"
+          unzip -o -q /tmp/podroid-assets-cache.zip -d app/src/main
+          rm -f /tmp/podroid-assets-cache.zip
+          echo "Backup download completed"
+
+      - name: Check if cache was downloaded
+        id: check-cache
+        run: |
+          if [ -d "app/src/main/jniLibs/arm64-v8a" ] && [ -f "app/src/main/assets/vmlinuz-virt" ]; then
+            echo "cache_found=true" >> $GITHUB_OUTPUT
+          else
+            echo "cache_found=false" >> $GITHUB_OUTPUT
+            echo "Cache not found, will build from scratch"
+          fi
+
+      - name: Build QEMU and native binaries
+        id: build-native
+        if: steps.check-cache.outputs.cache_found != 'true'
+        run: |
+          echo "Building native binaries..."
+          docker build \
+            --build-arg "QEMU_VERSION=11.0.0" \
+            -t podroid-qemu-builder --target final .
+
+      - name: Extract QEMU artifacts
+        id: extract-qemu
+        if: steps.check-cache.outputs.cache_found != 'true'
+        run: |
+          mkdir -p app/src/main/jniLibs/arm64-v8a app/src/main/assets/qemu/keymaps
+          docker rm -f podroid-qemu-extract 2>/dev/null || true
+          docker create --name podroid-qemu-extract podroid-qemu-builder /bin/true
+          docker cp podroid-qemu-extract:/libqemu-system-aarch64.so app/src/main/jniLibs/arm64-v8a/
+          docker cp podroid-qemu-extract:/libslirp.so app/src/main/jniLibs/arm64-v8a/
+          docker cp podroid-qemu-extract:/libpodroid-bridge.so app/src/main/jniLibs/arm64-v8a/
+          docker cp podroid-qemu-extract:/libpodroid-launcher.so app/src/main/jniLibs/arm64-v8a/
+          docker cp podroid-qemu-extract:/qemu/efi-virtio.rom app/src/main/assets/qemu/
+          docker cp podroid-qemu-extract:/qemu/keymaps/. app/src/main/assets/qemu/keymaps/
+          docker rm podroid-qemu-extract >/dev/null
+
+      - name: Build Alpine Rootfs SquashFS
+        id: build-rootfs
+        if: steps.check-cache.outputs.cache_found != 'true'
+        run: |
+          docker build -f build-rootfs/Dockerfile.rootfs \
+            -t podroid-rootfs:latest \
+            --output type=local,dest=app/src/main/assets \
+            build-rootfs/
+
+      - name: Build Kernel and Initramfs
+        id: build-kernel
+        if: steps.check-cache.outputs.cache_found != 'true'
+        run: |
+          kernel_ver=$(grep -E '^podroidKernelVersion=' gradle.properties | cut -d= -f2)
+          docker build --network=host \
+            --build-arg "KERNEL_VERSION=${kernel_ver}" \
+            -t podroid-builder --target packer .
+          docker rm -f podroid-extract 2>/dev/null || true
+          docker create --name podroid-extract podroid-builder /bin/true
+          mkdir -p app/src/main/assets
+          docker cp podroid-extract:/output/vmlinuz-virt app/src/main/assets/vmlinuz-virt
+          docker cp podroid-extract:/output/initrd.img app/src/main/assets/initrd.img
+          docker rm podroid-extract >/dev/null
+
+      - name: Upload assets cache
+        uses: actions/upload-artifact@v4
+        with:
+          name: podroid-assets-cache
+          path: |
+            app/src/main/jniLibs/arm64-v8a/*.so
+            app/src/main/assets/alpine-rootfs.squashfs
+            app/src/main/assets/vmlinuz-virt
+            app/src/main/assets/initrd.img
+            app/src/main/assets/qemu
+          retention-days: 7
+        if: steps.check-cache.outputs.cache_found != 'true'
+
+      - name: Verify 16KB page alignment
+        run: |
+          python3 .github/workflows/verify_align.py app/src/main/jniLibs/arm64-v8a/libqemu-system-aarch64.so
+
+      # Step 2: Update version info dynamically
+      - name: Update version in build.gradle.kts
+        if: github.event.inputs.version_name != ''
+        run: |
+          sed -i 's/^versionName = "[^"]*"/versionName = "${{ github.event.inputs.version_name }}"/' app/build.gradle.kts
+
+      # Step 3: Build APK
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+          cache: gradle
+
+      - name: Setup release keystore
+        if: github.event.inputs.release_type == 'release'
+        run: |
+          echo "${{ secrets.PODROID_RELEASE_STORE_FILE }}" | base64 -d > ${{ github.workspace }}/app/release-keystore.jks
+          echo "PODROID_RELEASE_STORE_FILE=${{ github.workspace }}/app/release-keystore.jks" >> $GITHUB_ENV
+          echo "PODROID_RELEASE_STORE_PASSWORD=${{ secrets.PODROID_RELEASE_STORE_PASSWORD }}" >> $GITHUB_ENV
+          echo "PODROID_RELEASE_KEY_ALIAS=${{ secrets.PODROID_RELEASE_KEY_ALIAS }}" >> $GITHUB_ENV
+          echo "PODROID_RELEASE_KEY_PASSWORD=${{ secrets.PODROID_RELEASE_KEY_PASSWORD }}" >> $GITHUB_ENV
+          ls -la ${{ github.workspace }}/app/release-keystore.jks
+
+      - name: Build APK
+        run: |
+          if [ "${{ github.event.inputs.release_type }}" = "release" ]; then
+            echo "Building release with environment-based signing"
+            ./gradlew assembleRelease
+          else
+            ./gradlew assembleDebug
+          fi
+
+      # Step 4: Upload artifact
+      - name: Get version info
+        id: version
+        run: |
+          if [ "${{ github.event.inputs.release_type }}" = "release" ]; then
+            echo "build_type=release" >> $GITHUB_OUTPUT
+            echo "file=app/build/outputs/apk/release/app-release.apk" >> $GITHUB_OUTPUT
+          else
+            echo "build_type=debug" >> $GITHUB_OUTPUT
+            echo "file=app/build/outputs/apk/debug/app-debug.apk" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: podroid-${{ steps.version.outputs.build_type }}-apk
+          path: ${{ steps.version.outputs.file }}
+          retention-days: 30

@@ -1,0 +1,172 @@
+name: Build APK
+
+# 当推送到 main 分支或创建 tag 时触发
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+
+# 设置作业
+jobs:
+  build-apk:
+    name: Build APK with Docker
+    runs-on: ubuntu-latest
+
+    # 步骤
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: |
+            image=moby/buildkit:latest
+            network=host
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Download cached assets from GitHub
+        id: download-cache-github
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: podroid-assets-cache
+          path: app/src/main
+
+      - name: Download cached assets from backup URL
+        id: download-cache-backup
+        continue-on-error: true
+        if: steps.download-cache-github.outcome != 'success'
+        env:
+          CACHE_BACKUP_URL: ${{ secrets.CACHE_BACKUP_URL }}
+        run: |
+          echo "GitHub Actions artifact download failed, trying backup URL..."
+          if [ -z "$CACHE_BACKUP_URL" ]; then
+            echo "CACHE_BACKUP_URL not set, skipping backup download"
+            exit 0
+          fi
+          mkdir -p app/src/main
+          curl -L -o /tmp/podroid-assets-cache.zip "$CACHE_BACKUP_URL"
+          unzip -o -q /tmp/podroid-assets-cache.zip -d app/src/main
+          rm -f /tmp/podroid-assets-cache.zip
+          echo "Backup download completed"
+
+      - name: Check if cache was downloaded
+        id: check-cache
+        run: |
+          if [ -d "app/src/main/jniLibs/arm64-v8a" ] && [ -f "app/src/main/assets/vmlinuz-virt" ]; then
+            echo "cache_found=true" >> $GITHUB_OUTPUT
+          else
+            echo "cache_found=false" >> $GITHUB_OUTPUT
+            echo "Cache not found, will build from scratch"
+          fi
+
+      - name: Build QEMU and native binaries
+        id: build-native
+        if: steps.check-cache.outputs.cache_found != 'true'
+        run: |
+          echo "Building native binaries..."
+          docker build \
+            --build-arg "QEMU_VERSION=11.0.0" \
+            -t podroid-qemu-builder --target final .
+
+      - name: Extract QEMU artifacts
+        id: extract-qemu
+        if: steps.check-cache.outputs.cache_found != 'true'
+        run: |
+          mkdir -p app/src/main/jniLibs/arm64-v8a app/src/main/assets/qemu/keymaps
+          docker rm -f podroid-qemu-extract 2>/dev/null || true
+          docker create --name podroid-qemu-extract podroid-qemu-builder /bin/true
+          docker cp podroid-qemu-extract:/libqemu-system-aarch64.so app/src/main/jniLibs/arm64-v8a/
+          docker cp podroid-qemu-extract:/libslirp.so app/src/main/jniLibs/arm64-v8a/
+          docker cp podroid-qemu-extract:/libpodroid-bridge.so app/src/main/jniLibs/arm64-v8a/
+          docker cp podroid-qemu-extract:/libpodroid-launcher.so app/src/main/jniLibs/arm64-v8a/
+          docker cp podroid-qemu-extract:/qemu/efi-virtio.rom app/src/main/assets/qemu/
+          docker cp podroid-qemu-extract:/qemu/keymaps/. app/src/main/assets/qemu/keymaps/
+          docker rm podroid-qemu-extract >/dev/null
+
+      - name: Build Alpine Rootfs SquashFS
+        id: build-rootfs
+        if: steps.check-cache.outputs.cache_found != 'true'
+        run: |
+          docker build -f build-rootfs/Dockerfile.rootfs \
+            -t podroid-rootfs:latest \
+            --output type=local,dest=app/src/main/assets \
+            build-rootfs/
+
+      - name: Build Kernel and Initramfs
+        id: build-kernel
+        if: steps.check-cache.outputs.cache_found != 'true'
+        run: |
+          kernel_ver=$(grep -E '^podroidKernelVersion=' gradle.properties | cut -d= -f2)
+          docker build --network=host \
+            --build-arg "KERNEL_VERSION=${kernel_ver}" \
+            -t podroid-builder --target packer .
+          docker rm -f podroid-extract 2>/dev/null || true
+          docker create --name podroid-extract podroid-builder /bin/true
+          mkdir -p app/src/main/assets
+          docker cp podroid-extract:/output/vmlinuz-virt app/src/main/assets/vmlinuz-virt
+          docker cp podroid-extract:/output/initrd.img app/src/main/assets/initrd.img
+          docker rm podroid-extract >/dev/null
+
+      - name: Upload assets cache
+        uses: actions/upload-artifact@v4
+        with:
+          name: podroid-assets-cache
+          path: |
+            app/src/main/jniLibs/arm64-v8a/*.so
+            app/src/main/assets/alpine-rootfs.squashfs
+            app/src/main/assets/vmlinuz-virt
+            app/src/main/assets/initrd.img
+            app/src/main/assets/qemu
+          retention-days: 7
+        if: steps.check-cache.outputs.cache_found != 'true'
+
+      - name: Verify 16KB page alignment
+        run: |
+          python3 .github/workflows/verify_align.py app/src/main/jniLibs/arm64-v8a/libqemu-system-aarch64.so
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+          cache: gradle
+
+      - name: Build APK (Debug)
+        run: |
+          ./gradlew assembleDebug
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: podroid-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 7
+
+      - name: Get version info
+        id: version
+        run: |
+          VERSION_NAME=$(grep -E '^versionName = ' app/build.gradle.kts | sed 's/.*"\([^"]*\)".*/\1/')
+          VERSION_CODE=$(grep -E '^versionCode = ' app/build.gradle.kts | sed 's/.*= //')
+          echo "version_name=${VERSION_NAME}" >> $GITHUB_OUTPUT
+          echo "version_code=${VERSION_CODE}" >> $GITHUB_OUTPUT
+
+      - name: Create Release (on tag push)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: app/build/outputs/apk/debug/app-debug.apk
+          name: Release ${{ steps.version.outputs.version_name }}
+          tag_name: ${{ github.ref_name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
