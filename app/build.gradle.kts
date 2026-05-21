@@ -39,12 +39,33 @@ android {
 
     signingConfigs {
         create("release") {
-            val storePath = (project.findProperty("PODROID_RELEASE_STORE_FILE") as? String)
-            if (storePath != null && file(storePath).exists()) {
-                storeFile     = file(storePath)
-                storePassword = project.findProperty("PODROID_RELEASE_STORE_PASSWORD") as? String
-                keyAlias      = project.findProperty("PODROID_RELEASE_KEY_ALIAS")      as? String
-                keyPassword   = project.findProperty("PODROID_RELEASE_KEY_PASSWORD")   as? String
+            // Use System.getenv for GitHub Actions, project properties otherwise
+            val storePath = System.getenv("PODROID_RELEASE_STORE_FILE")
+                ?: (project.findProperty("PODROID_RELEASE_STORE_FILE") as? String)
+            val storePasswordProp = System.getenv("PODROID_RELEASE_STORE_PASSWORD")
+                ?: (project.findProperty("PODROID_RELEASE_STORE_PASSWORD") as? String)
+            val keyAliasProp = System.getenv("PODROID_RELEASE_KEY_ALIAS")
+                ?: (project.findProperty("PODROID_RELEASE_KEY_ALIAS") as? String)
+            val keyPasswordProp = System.getenv("PODROID_RELEASE_KEY_PASSWORD")
+                ?: (project.findProperty("PODROID_RELEASE_KEY_PASSWORD") as? String)
+
+            // Only configure if all properties are provided
+            if (storePath != null && storePath.isNotEmpty() &&
+                storePasswordProp != null && storePasswordProp.isNotEmpty() &&
+                keyAliasProp != null && keyAliasProp.isNotEmpty() &&
+                keyPasswordProp != null && keyPasswordProp.isNotEmpty()
+            ) {
+                val storeFileObj = file(storePath)
+                if (storeFileObj.exists()) {
+                    storeFile = storeFileObj
+                    storePassword = storePasswordProp
+                    keyAlias = keyAliasProp
+                    keyPassword = keyPasswordProp
+                } else {
+                    println("WARNING: Keystore not found at $storePath")
+                }
+            } else {
+                println("WARNING: Signing properties not fully configured (storePath=$storePath)")
             }
         }
     }
